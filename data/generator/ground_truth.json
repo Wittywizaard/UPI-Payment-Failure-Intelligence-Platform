@@ -1,0 +1,20 @@
+{
+  "fingerprint": {
+    "payer_bank": "BANK_A",
+    "device_type": "Android",
+    "os": "U28",
+    "app_version": "4.2.1"
+  },
+  "window": {
+    "date": "2026-08-29",
+    "start_hour": 18,
+    "end_hour": 20
+  },
+  "segment_transaction_count": 273,
+  "segment_failed_count": 111,
+  "segment_observed_failure_rate": 0.4066,
+  "segment_value_at_risk": 143953.43,
+  "baseline_failure_rate": 0.028,
+  "seed": 42,
+  "total_transaction_count": 20285
+}

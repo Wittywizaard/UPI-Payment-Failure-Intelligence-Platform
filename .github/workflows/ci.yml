@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: upi_fip
+          POSTGRES_PASSWORD: localtest
+          POSTGRES_DB: upi_fip
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U upi_fip -d upi_fip"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL_PSYCOPG: postgresql://upi_fip:localtest@localhost:5432/upi_fip
+      DATABASE_URL: postgresql+psycopg2://upi_fip:localtest@localhost:5432/upi_fip
+      DATABASE_URL_TEST: postgresql+psycopg2://upi_fip:localtest@localhost:5432/upi_fip
+      JWT_SECRET: ci-test-secret
+      CORS_ORIGINS: http://localhost:3000
+      # Deliberately matches the local/demo default (750K), NOT a smaller CI-only
+      # size: several tests assert specific values (e.g. the injected anomaly
+      # segment's ~58.28% PSR) derived from this exact seed+count combination.
+      # The generator is deterministic, so this reproduces byte-identical
+      # results to local development. A smaller count changes the RNG draw
+      # sequence entirely, producing different (still valid, but non-matching)
+      # numbers -- confirmed by testing 50K locally before choosing this
+      # value; see docs/decisions.md D39.
+      SYNTHETIC_TRANSACTION_COUNT: "750000"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Ensure postgresql-client is available
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Apply database schema
+        run: |
+          PGPASSWORD=localtest psql -h localhost -U upi_fip -d upi_fip -f sql/migrations/001_init.sql
+          PGPASSWORD=localtest psql -h localhost -U upi_fip -d upi_fip -f sql/migrations/002_observability.sql
+
+      - name: Seed reference data
+        working-directory: data/generator
+        run: |
+          python seed_error_codes.py
+          python seed_users.py
+          python seed_experiment.py
+
+      - name: Generate and load synthetic dataset (same size as local dev — see env note above)
+        working-directory: data/generator
+        run: |
+          python generate_transactions.py --seed 42 --count 750000 \
+            --out /tmp/transactions.csv --ground-truth-out ground_truth.json
+          python load_to_postgres.py --csv /tmp/transactions.csv --truncate
+
+      - name: Run generator test suite
+        working-directory: data/generator
+        run: pytest tests/test_generator.py -v
+
+      - name: Run backend integration test suite
+        working-directory: backend
+        run: pytest tests/integration/ -v
+
+  frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Build (type-checks and compiles all routes)
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+        run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [backend]  # reuses the schema/seed steps' correctness, though this job seeds its own db
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: upi_fip
+          POSTGRES_PASSWORD: localtest
+          POSTGRES_DB: upi_fip
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U upi_fip -d upi_fip"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL_PSYCOPG: postgresql://upi_fip:localtest@localhost:5432/upi_fip
+      DATABASE_URL: postgresql+psycopg2://upi_fip:localtest@localhost:5432/upi_fip
+      JWT_SECRET: ci-test-secret
+      CORS_ORIGINS: http://localhost:3000
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package.json
+
+      - name: Ensure postgresql-client is available
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Apply database schema
+        run: |
+          PGPASSWORD=localtest psql -h localhost -U upi_fip -d upi_fip -f sql/migrations/001_init.sql
+          PGPASSWORD=localtest psql -h localhost -U upi_fip -d upi_fip -f sql/migrations/002_observability.sql
+
+      - name: Seed reference data and synthetic dataset (same size as local dev -- see D39)
+        working-directory: data/generator
+        run: |
+          python seed_error_codes.py
+          python seed_users.py
+          python seed_experiment.py
+          python generate_transactions.py --seed 42 --count 750000 \
+            --out /tmp/transactions.csv --ground-truth-out ground_truth.json
+          python load_to_postgres.py --csv /tmp/transactions.csv --truncate
+
+      - name: Start backend API
+        working-directory: backend
+        run: nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > /tmp/backend.log 2>&1 &
+
+      - name: Wait for backend to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/api/health && exit 0
+            sleep 1
+          done
+          echo "Backend did not become healthy in time"; cat /tmp/backend.log; exit 1
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Start frontend
+        working-directory: frontend
+        run: nohup npm run dev > /tmp/frontend.log 2>&1 &
+
+      - name: Wait for frontend to be ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/login && exit 0
+            sleep 1
+          done
+          echo "Frontend did not become ready in time"; cat /tmp/frontend.log; exit 1
+
+      - name: Run Playwright E2E tests
+        working-directory: frontend
+        run: npx playwright test
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
